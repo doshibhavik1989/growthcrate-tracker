@@ -600,6 +600,7 @@
     <button class="tab" data-tab="new">＋ New Task</button>
     <button class="tab" data-tab="worklog">Daily Worklog</button>
     <button class="tab" data-tab="team">By Team Member</button>
+    <button class="tab" data-tab="deleted" id="deleted-tab">🗑 Deleted Tasks</button>
     <button class="tab" data-tab="settings" id="settings-tab">⚙ Team Settings</button>
   </div>
 
@@ -736,6 +737,13 @@
     <div id="team-summary"></div>
   </div>
 
+  <div class="panel" id="panel-deleted">
+    <div style="background:var(--warn-bg);border-left:3px solid var(--warn-ink);border-radius:var(--radius);padding:12px 16px;margin-bottom:18px;font-size:13px;color:var(--warn-ink);">
+      <strong>Partner-only view.</strong> Every deleted task is archived here with who deleted it and when. You can restore any task back to the active list.
+    </div>
+    <div id="deleted-list"></div>
+  </div>
+
   <div class="panel" id="panel-settings">
     <div class="form-card">
       <h3>Manage team members</h3>
@@ -808,6 +816,13 @@ function fmtDate(d) {
   const dt = new Date(d);
   if (isNaN(dt)) return '—';
   return dt.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+function fmtDateTime(d) {
+  if (!d) return '—';
+  const dt = new Date(d);
+  if (isNaN(dt)) return '—';
+  return dt.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) + ' ' +
+    dt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
 }
 function toast(msg, isError) {
   const t = document.getElementById('toast');
@@ -894,12 +909,12 @@ function updateUserBar() {
 }
 
 function updateSettingsTabVisibility() {
-  const tab = document.getElementById('settings-tab');
-  if (PARTNERS.includes(currentUser)) {
-    tab.classList.remove('hidden');
-  } else {
-    tab.classList.add('hidden');
-    if (document.querySelector('.tab.active')?.dataset.tab === 'settings') {
+  const isPartner = PARTNERS.includes(currentUser);
+  document.getElementById('settings-tab').classList.toggle('hidden', !isPartner);
+  document.getElementById('deleted-tab').classList.toggle('hidden', !isPartner);
+  if (!isPartner) {
+    const active = document.querySelector('.tab.active');
+    if (active && (active.dataset.tab === 'settings' || active.dataset.tab === 'deleted')) {
       document.querySelector('.tab[data-tab="dashboard"]').click();
     }
   }
@@ -938,9 +953,9 @@ function getAdminPassword() {
 // Tabs
 document.querySelectorAll('.tab').forEach(btn => {
   btn.addEventListener('click', () => {
-    if (btn.dataset.tab === 'settings') {
+    if (btn.dataset.tab === 'settings' || btn.dataset.tab === 'deleted') {
       if (!PARTNERS.includes(currentUser)) {
-        toast('Only partners can access Team Settings', true);
+        toast('Only partners can access this tab', true);
         return;
       }
       promptAdmin(() => activateTab(btn));
@@ -957,6 +972,7 @@ function activateTab(btn) {
   document.getElementById('panel-' + btn.dataset.tab).classList.add('active');
   if (btn.dataset.tab === 'new') populateClientList();
   if (btn.dataset.tab === 'worklog') populateTaskDropdown();
+  if (btn.dataset.tab === 'deleted') loadDeletedTasks();
   renderAll();
 }
 
@@ -1072,21 +1088,31 @@ function editTask(id) {
 
 async function quickStatus(id, status) {
   try {
-    await api('updateStatus', { id, status });
+    await api('updateStatus', { id, status, updatedBy: currentUser || 'Unknown' });
     const t = state.tasks.find(x => x.id === id);
-    if (t) { t.status = status; renderAll(); }
+    if (t) {
+      t.status = status;
+      if (status === 'Done') {
+        t.completedAt = new Date().toISOString();
+        t.completedBy = currentUser || '';
+      } else {
+        t.completedAt = '';
+        t.completedBy = '';
+      }
+      renderAll();
+    }
     toast('Status updated');
     loadData();
   } catch (e) { toast(e.message, true); }
 }
 
 async function deleteTask(id) {
-  if (!confirm('Delete this task?')) return;
+  if (!confirm('Delete this task? It will be archived in Deleted Tasks where partners can restore it if needed.')) return;
   try {
-    await api('deleteTask', { id });
+    await api('deleteTask', { id, deletedBy: currentUser || 'Unknown' });
     state.tasks = state.tasks.filter(t => t.id !== id);
     renderAll();
-    toast('Task deleted');
+    toast('Task deleted — archived in Deleted Tasks');
   } catch (e) { toast(e.message, true); }
 }
 
@@ -1195,7 +1221,10 @@ function taskCard(t) {
       <button class="small" onclick="editTask('${t.id}')">Edit</button>
       <button class="small danger" onclick="deleteTask('${t.id}')">Delete</button>
     </div>
-    ${t.createdBy ? `<div class="task-created-by">Added by ${escapeHtml(t.createdBy)}${t.created ? ' · ' + fmtDate(t.created) : ''}</div>` : ''}
+    ${t.createdBy ? `<div class="task-created-by">
+      Added by ${escapeHtml(t.createdBy)}${t.created ? ' · ' + fmtDate(t.created) : ''}
+      ${t.completedAt ? ' &nbsp;|&nbsp; ✓ Completed by ' + escapeHtml(t.completedBy || '—') + ' on ' + fmtDateTime(t.completedAt) : ''}
+    </div>` : (t.completedAt ? `<div class="task-created-by">✓ Completed by ${escapeHtml(t.completedBy || '—')} on ${fmtDateTime(t.completedAt)}</div>` : '')}
   </div>`;
 }
 
@@ -1411,6 +1440,60 @@ function startPolling() {
   pollTimer = setInterval(() => {
     if (document.visibilityState === 'visible') loadData();
   }, 20000);
+}
+
+// Deleted tasks
+async function loadDeletedTasks() {
+  const el = document.getElementById('deleted-list');
+  el.innerHTML = '<div class="empty">Loading...</div>';
+  try {
+    const res = await api('getDeletedTasks', { password: getAdminPassword() });
+    renderDeletedTasks(res.deleted || []);
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Error: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderDeletedTasks(list) {
+  const el = document.getElementById('deleted-list');
+  if (!list.length) {
+    el.innerHTML = '<div class="empty">No deleted tasks. Clean record! 👍</div>';
+    return;
+  }
+  list.sort((a, b) => (b.deletedAt || '').localeCompare(a.deletedAt || ''));
+  el.innerHTML = list.map(t => `
+    <div class="task-card" style="border-left:3px solid var(--danger-ink); opacity:0.92;">
+      <div class="task-head">
+        <div class="task-title" style="text-decoration:line-through; color:var(--ink-2);">${escapeHtml(t.title)}</div>
+        <div class="task-badges">
+          ${t.priority ? `<span class="badge badge-${(t.priority||'').toLowerCase()}">${escapeHtml(t.priority)}</span>` : ''}
+          <span class="badge" style="background:var(--danger-bg);color:var(--danger-ink);">Deleted</span>
+        </div>
+      </div>
+      <div class="task-meta">
+        ${t.client ? `<span>👤 ${escapeHtml(t.client)}</span>` : ''}
+        <span>◆ ${escapeHtml(t.assignee || '—')}</span>
+        <span>▤ ${escapeHtml(t.category || '—')}</span>
+        ${t.due ? `<span>📅 ${fmtDate(t.due)}</span>` : ''}
+      </div>
+      <div class="task-created-by" style="color:var(--danger-ink);">
+        🗑 Deleted by <strong>${escapeHtml(t.deletedBy || '—')}</strong> on ${fmtDateTime(t.deletedAt)}
+        ${t.createdBy ? ` &nbsp;|&nbsp; Originally added by ${escapeHtml(t.createdBy)}` : ''}
+      </div>
+      <div class="task-actions" style="margin-top:8px;">
+        <button class="small primary" onclick="restoreTask('${escapeHtml(t.id)}')">↩ Restore task</button>
+      </div>
+    </div>`).join('');
+}
+
+async function restoreTask(id) {
+  if (!confirm('Restore this task back to the active task list?')) return;
+  try {
+    await api('restoreTask', { id, password: getAdminPassword() });
+    toast('Task restored successfully');
+    await loadData();
+    loadDeletedTasks();
+  } catch (e) { toast(e.message, true); }
 }
 
 // CSV export
